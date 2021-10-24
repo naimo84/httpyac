@@ -4,8 +4,13 @@ import * as utils from '../utils';
 import { log, userInteractionProvider } from '../io';
 
 export async function parseVariable(getLineReader: models.getHttpLineGenerator, { httpRegion }: models.ParserContext): Promise<models.HttpRegionParserResult> {
-  const lineReader = getLineReader();
+  if (!httpRegion.variables) {
+    httpRegion.hooks.execute.addInterceptor(new VariableInterceptor());
+    httpRegion.variables = {};
+  }
 
+
+  const lineReader = getLineReader();
   const next = lineReader.next();
   if (!next.done) {
     const textLine = next.value.textLine;
@@ -13,9 +18,9 @@ export async function parseVariable(getLineReader: models.getHttpLineGenerator, 
     const match = ParserRegex.variable.exec(textLine);
 
     if (match && match.groups && match.groups.key && match.groups.value) {
-      httpRegion.hooks.execute.addObjHook(obj => obj.process, new VariableAction({
-        [match.groups.key]: match.groups.value.trim(),
-      }));
+
+      httpRegion.variables[match.groups.key] = match.groups.value.trim();
+
       return {
         nextParserLine: next.value.line,
         symbols: [{
@@ -51,27 +56,74 @@ export async function parseVariable(getLineReader: models.getHttpLineGenerator, 
 }
 
 
-class VariableAction {
+class VariableInterceptor implements models.HookInterceptor<models.ProcessorContext, boolean> {
   id = models.ActionType.variable;
 
-  constructor(private readonly data: Record<string, string>) { }
+  private variables: models.Variables | undefined;
 
-  async process(context: models.ProcessorContext): Promise<boolean> {
-    if (this.data) {
-      for (const [key, value] of Object.entries(this.data)) {
+
+  async beforeLoop(context: models.HookTriggerContext<models.ProcessorContext, true>) {
+    this.initRegionScopedVariables(context.arg);
+    await this.setCurrentVariables(context.arg);
+    await this.replaceAllVariables(context.arg);
+    return true;
+  }
+
+  private async replaceAllVariables(context: models.ProcessorContext) : Promise<boolean> {
+    for (const [key, value] of Object.entries(context.variables)) {
+      const result: typeof models.HookCancel | unknown = await utils.replaceVariables(value, models.VariableType.variable, context);
+      if (result !== models.HookCancel) {
+        context.variables[key] = result;
+      }
+    }
+    return true;
+  }
+
+
+  private initRegionScopedVariables(context: models.ProcessorContext) {
+    const env = utils.toEnvironmentKey(context.httpFile.activeEnvironment);
+    const variables = Object.assign(
+      {},
+      context.variables,
+      ...context.httpFile.httpRegions
+        .filter(obj => utils.isGlobalHttpRegion(obj))
+        .map(obj => obj.variablesPerEnv[env])
+    );
+    this.variables = context.variables;
+    context.variables = variables;
+  }
+
+  private async setCurrentVariables(context: models.ProcessorContext) {
+    if (context.httpRegion.variables) {
+      const replacedVariables: models.Variables = {};
+      for (const [key, value] of Object.entries(context.httpRegion.variables)) {
         if (utils.isValidVariableName(key)) {
-          const result = await utils.replaceVariables(value, models.VariableType.variable, context);
-          if (result === models.HookCancel) {
-            return false;
-          }
-          utils.setVariableInContext({ [key]: result }, context);
+          replacedVariables[key] = await utils.replaceVariables(value, models.VariableType.variable, context);
         } else {
           const message = `Javascript Keyword ${key} not allowed as variable`;
           userInteractionProvider.showWarnMessage?.(message);
           log.warn(message);
         }
       }
+      utils.setVariableInContext(replacedVariables, context);
+    }
+  }
+
+  async afterLoop(context: models.HookTriggerContext<models.ProcessorContext, true>) {
+    this.autoShareNewVariables(context);
+    if (this.variables) {
+      context.arg.variables = this.variables;
     }
     return true;
+  }
+
+  private autoShareNewVariables(context: models.HookTriggerContext<models.ProcessorContext, true>) {
+    if (this.variables) {
+      for (const [key, value] of Object.entries(context.arg.variables)) {
+        if (!this.variables[key]) {
+          this.variables[key] = value;
+        }
+      }
+    }
   }
 }

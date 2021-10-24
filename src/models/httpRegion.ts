@@ -9,6 +9,7 @@ export interface ProcessedHttpRegion{
   request?: Request;
   response?: HttpResponse;
   symbol: HttpSymbol;
+  variables?: Variables;
   metaData: Record<string, string | undefined>;
   testResults?: Array<TestResult>;
   responseRefs?: Array<string>;
